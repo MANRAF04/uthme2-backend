@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+requests
+beautifulsoup4
+celery
+redis
+psycopg2-binary
+sqlalchemy
+cryptography

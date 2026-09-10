@@ -1,0 +1,59 @@
+name: Deploy to server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-server
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'MANRAF04/uthme2-backend'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring up WireGuard
+        env:
+          WG_CONFIG: ${{ secrets.WG_CONFIG }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wireguard
+          printf '%s\n' "$WG_CONFIG" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+
+      - name: Load SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Build and restart containers on the server
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          COMPOSE_DIR: ${{ secrets.COMPOSE_DIR }}
+          COMPOSE_SERVICES: ${{ vars.COMPOSE_SERVICES }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 \
+            "$SSH_USER@$SSH_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' COMPOSE_DIR='$COMPOSE_DIR' COMPOSE_SERVICES='$COMPOSE_SERVICES' GIT_SHA='$GITHUB_SHA' bash -s" \
+            < .github/scripts/deploy.sh
+
+      - name: Tear down WireGuard
+        if: always()
+        run: sudo wg-quick down wg0 || true
