@@ -14,11 +14,14 @@ university portal through an OpenVPN tunnel.
 | `security.py` | Password hashing (scrypt) and Fernet encryption for credentials in transit |
 | `uth.ovpn` | VPN profile. Gitignored, kept on the server only |
 
-Services expected on the docker network: `postgres-grades:5432` and `redis-grades:6379`.
+Runs as three containers built from this directory (`grades-api`, `grades-worker`,
+`grades-beat`), against `postgres-grades:5432` and `redis-grades:6379`.
 
 ## Environment
 
-Copy `.env.example` to `.env` and fill it in:
+These come from the `.env` next to `docker-compose.yml`, which compose interpolates into the
+service definitions. The app reads plain environment variables, never a `.env` file. See
+`.env.example` for the list.
 
 | Variable | Used by | Notes |
 | --- | --- | --- |
@@ -48,55 +51,46 @@ The Celery worker starts OpenVPN itself, so its container needs `NET_ADMIN` and 
 Pushing to `main` (or running the workflow manually) triggers `.github/workflows/deploy.yml`:
 
 1. The runner brings up a WireGuard interface from the `WG_CONFIG` secret, joining the same
-   network you use for remote access.
+   network used for remote access.
 2. It SSHes to the server over that tunnel and pipes in `.github/scripts/deploy.sh`.
-3. The script fetches, hard-resets the checkout to the pushed commit, runs
-   `docker compose build` and `up -d`, then prunes dangling images.
-4. WireGuard comes down, runner is discarded.
+3. That script refuses to run if the checkout has uncommitted changes to tracked files or if
+   `uth.ovpn` is missing, then fast-forwards `main` to the pushed commit.
+4. `docker compose build` and `up -d`, limited to the grades services, then dangling images are
+   pruned.
+5. WireGuard comes down, the runner is discarded.
 
 SSH stays reachable only from the LAN and WireGuard. Nothing new is exposed publicly.
 
-### 1. Server checkout
+The checkout is the same directory the compose file builds from, so a deploy fast-forwards it
+rather than hard-resetting it. Local edits are never destroyed, the deploy fails instead and
+tells you to commit them. It does switch the checkout to `main` if you left it on another
+branch.
 
-```
-git clone https://github.com/MANRAF04/uthme2-backend.git /opt/uthme2-backend
-cd /opt/uthme2-backend
-cp .env.example .env    # then fill it in
-```
+### 1. Server prerequisites
 
-Copy the VPN profile in, once. It is gitignored, and `COPY . .` in the Dockerfile picks it up
-from the build context, so it has to sit next to the source:
-
-```
-scp uth.ovpn <user>@<server>:/opt/uthme2-backend/uth.ovpn
-```
-
-The deploy refuses to build if it is missing, rather than shipping an image that fails at the
-first scrape. Being untracked, it survives every deploy.
-
-The repo is public, so no deploy key is needed for pulls. `.env` is gitignored and survives the
-deploy reset, since only tracked files are reset.
-
-Make sure the deploy user can talk to docker (`usermod -aG docker <user>`) and that
-`docker compose ps` works from the directory holding `docker-compose.yml`.
+- The repo cloned (or already present) at the path the compose `build:` context points to.
+- `uth.ovpn` in that directory. It is gitignored, so it is invisible to git and survives every
+  deploy, but a fresh clone will not have it.
+- The `.env` next to `docker-compose.yml` filled in.
+- The deploy user in the `docker` group.
 
 ### 2. WireGuard peer for CI
 
-Generate a keypair for the runner, anywhere:
+Generate a keypair for the runner:
 
 ```
 wg genkey | tee ci.key | wg pubkey > ci.pub
 ```
 
-Add the peer on the WireGuard server, using a free address in your subnet:
+Add the peer, using a free address in your subnet:
 
 ```
 sudo wg set wg0 peer "$(cat ci.pub)" allowed-ips 10.8.0.50/32
 sudo wg-quick save wg0
 ```
 
-`wg set` applies immediately without dropping existing peers, `wg-quick save` writes it to
-`/etc/wireguard/wg0.conf` so it survives a restart.
+`wg set` applies immediately without dropping existing peers, `wg-quick save` persists it to
+`/etc/wireguard/wg0.conf`.
 
 The config that goes into the `WG_CONFIG` secret, with `ci.key` as the private key:
 
@@ -132,15 +126,15 @@ Add the public half to `~/.ssh/authorized_keys`, pinned to the CI peer address:
 from="10.8.0.50",restrict ssh-ed25519 AAAA... github-actions
 ```
 
-`from=` means the key is only usable from inside the tunnel, `restrict` disables port forwarding,
+`from=` means the key only works from inside the tunnel, `restrict` disables port forwarding,
 agent forwarding and pty allocation. Keep the private half for the secret below, then delete it
 from the server.
 
-Capture the host key, running this from inside the LAN or WireGuard, against the same address the
-workflow connects to:
+Capture the host key from inside the LAN or tunnel, against the same address the workflow
+connects to:
 
 ```
-ssh-keyscan -p 22 10.8.0.1
+ssh-keyscan 10.8.0.1
 ```
 
 ### 4. GitHub secrets
@@ -154,12 +148,13 @@ ssh-keyscan -p 22 10.8.0.1
 | `SSH_USER` | User to SSH as |
 | `SSH_KEY` | `~/.ssh/gha_deploy`, whole file including the header lines |
 | `SSH_KNOWN_HOSTS` | Output of the `ssh-keyscan` above |
+| `DEPLOY_PATH` | Absolute path of the checkout, e.g. `/home/manraf/grades-api` |
+| `COMPOSE_DIR` | Directory holding `docker-compose.yml`, e.g. `/home/manraf/server` |
 | `SSH_PORT` | Optional, defaults to `22` |
-| `DEPLOY_PATH` | Absolute path of the clone, e.g. `/opt/uthme2-backend` |
-| `COMPOSE_DIR` | Optional, directory holding `docker-compose.yml` if it is not `DEPLOY_PATH` |
 
-Optional repository *variable* `COMPOSE_SERVICES`: space separated service names to limit the
-build and restart (e.g. `api worker beat`). Empty means the whole stack.
+Optional repository *variable* `COMPOSE_SERVICES`, space separated. It defaults to
+`grades-api grades-worker grades-beat` in the script, which is what keeps a shared compose file
+from rebuilding and recreating unrelated services.
 
 ### Notes
 
@@ -167,6 +162,5 @@ build and restart (e.g. `api worker beat`). Empty means the whole stack.
   masks them, which is why the workflow never runs `wg show` or `ssh -v`.
 - The job is guarded by `if: github.repository == 'MANRAF04/uthme2-backend'`, so pushes to forks
   do not attempt a deploy.
-- The deploy runs `git checkout -B main <pushed sha>`, so uncommitted edits to tracked files on
-  the server are discarded. Untracked files (`.env`, `uth.ovpn`, volumes) are left alone.
-- `--remove-orphans` is deliberately not used, so containers outside the compose file are safe.
+- `--remove-orphans` is deliberately not used. On a shared compose file it would stop every
+  container that is not defined in it.
