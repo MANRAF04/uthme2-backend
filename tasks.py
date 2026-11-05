@@ -3,7 +3,7 @@ import time
 import subprocess
 from celery import Celery
 from celery.schedules import crontab
-from dine_scraper import fetch_menus
+from dine_scraper import fetch_menus, fetch_dining_card
 from scraper import fetch_grades
 from database import SessionLocal, engine
 import models
@@ -11,7 +11,8 @@ import grade_notifications
 import menu_notifications
 import security
 from models import Grade, User, Restaurant, MenuItem, RestaurantMealType
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 models.Base.metadata.create_all(bind=engine)
 models.ensure_schema_upgrades(engine)
@@ -33,6 +34,10 @@ app.conf.beat_schedule = {
     },
 }
 app.conf.timezone = 'Europe/Athens'
+
+# Cards are issued once a year, so a valid one is not re-fetched until it expires.
+# Without one, students may apply any time, so look again weekly.
+DINING_CARD_RECHECK = timedelta(days=7)
 
 # The grade worker holds the VPN up, and uth.ovpn sets `redirect-gateway def1`,
 # so anything it sends leaves through the university network. Push fan-out goes
@@ -242,8 +247,17 @@ def sync_user_grades(self, user_id: int, username: str, encrypted_password: str)
         if "error" in scrape_result:
             return {"status": "error", "message": scrape_result["error"]}
 
+        # A missing dining card must not cost the student their grades.
+        card_result = {"status": "skipped"}
+        if dining_card_due(user_id):
+            card_result = fetch_dining_card(username, password)
+        if card_result["status"] == "error":
+            print(f"[Worker] Dining card fetch failed for {username}: {card_result['message']}")
+
         # 5. Save the data to PostgreSQL
-        newly_graded = save_to_database(user_id, scrape_result["data"], password)
+        newly_graded = save_to_database(
+            user_id, scrape_result["data"], password, scrape_result["profile"], card_result
+        )
         
         return {"status": "success", "message": f"Successfully synced {len(scrape_result['data'])} grades."}
 
@@ -267,7 +281,52 @@ def sync_user_grades(self, user_id: int, username: str, encrypted_password: str)
             notify_graded_courses.delay(user_id, newly_graded)
 
 
-def save_to_database(user_id: int, parsed_grades: list, password: str):
+def dining_card_due(user_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+    finally:
+        db.close()
+
+    if user is None or user.dining_card_checked_at is None:
+        return True
+
+    today = datetime.now(ZoneInfo("Europe/Athens")).date()
+    holds_valid_card = (
+        user.dining_card_active
+        and user.dining_card_valid_to is not None
+        and today <= user.dining_card_valid_to
+    )
+    if holds_valid_card:
+        return False
+    return datetime.now(timezone.utc) - user.dining_card_checked_at >= DINING_CARD_RECHECK
+
+
+def apply_profile(user: User, profile: dict, card_result: dict):
+    """Copies scraped identifiers onto the user. A failed lookup leaves stored values alone."""
+    for field, value in profile.items():
+        if value is not None:
+            setattr(user, field, value)
+
+    if card_result["status"] != "success":
+        return
+
+    user.dining_card_checked_at = datetime.now(timezone.utc)
+    card = card_result["card"]
+    if card is None:
+        user.dining_card_active = None
+        user.dining_card_valid_from = None
+        user.dining_card_valid_to = None
+        return
+
+    if card["academic_no"]:
+        user.academic_no = card["academic_no"]
+    user.dining_card_active = card["active"]
+    user.dining_card_valid_from = card["valid_from"]
+    user.dining_card_valid_to = card["valid_to"]
+
+
+def save_to_database(user_id: int, parsed_grades: list, password: str, profile: dict, card_result: dict):
     """
     Upserts (Updates or Inserts) grades into PostgreSQL.
 
@@ -334,6 +393,7 @@ def save_to_database(user_id: int, parsed_grades: list, password: str):
         if user:
             user.last_updated = datetime.utcnow()
             user.encrypted_password = security.hash_password(password)
+            apply_profile(user, profile, card_result)
 
         db.commit()
     except Exception as e:

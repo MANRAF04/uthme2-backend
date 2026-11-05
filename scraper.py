@@ -79,7 +79,8 @@ def fetch_grades(username, password):
             
         # Extract the profile ID from the first active student profile
         profile_token = student_profiles[0].get("id")
-        
+        profile = extract_profile(student_profiles[0])
+
         # 4. Lock in the final headers needed for the Grades API
         referer_url = f"https://sis-web.uth.gr/student/grades/list_diploma?p={profile_token}"
         
@@ -111,10 +112,30 @@ def fetch_grades(username, password):
         
         return {
             "status": "success",
-            "data": clean_data
+            "data": clean_data,
+            "profile": profile,
         }
     except Exception as e:
         return {"error": f"Failed to fetch JSON API: {str(e)}"}
+
+
+def extract_profile(sis_profile):
+    """Keeps only the identifiers the app shows or the notifier scopes by."""
+    source_keys = {
+        "student_no": "studentNo",
+        "department_code": "departmentCode",
+        "program_code": "programCode",
+    }
+    profile = {}
+    for field, key in source_keys.items():
+        value = sis_profile.get(key)
+        profile[field] = str(value) if value is not None else None
+
+    missing = [field for field, value in profile.items() if value is None]
+    if missing:
+        # Keys only, never values: the profile carries personal data.
+        print(f"[Scraper] Profile missing {missing}. Available keys: {sorted(sis_profile.keys())}")
+    return profile
 
 
 def parse_and_clean_grades(raw_json):

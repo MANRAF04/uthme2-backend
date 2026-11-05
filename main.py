@@ -34,6 +34,32 @@ def serialize_grade(g):
         "updated_at": g.updated_at.isoformat() if g.updated_at else None,
     }
 
+def has_free_meals(user, today) -> bool:
+    if not user.dining_card_active:
+        return False
+    if user.dining_card_valid_from and today < user.dining_card_valid_from:
+        return False
+    if user.dining_card_valid_to and today > user.dining_card_valid_to:
+        return False
+    return True
+
+def serialize_profile(user):
+    dining_card = None
+    if user.dining_card_active is not None:
+        dining_card = {
+            "active": user.dining_card_active,
+            "valid_from": user.dining_card_valid_from.isoformat() if user.dining_card_valid_from else None,
+            "valid_to": user.dining_card_valid_to.isoformat() if user.dining_card_valid_to else None,
+        }
+    return {
+        "student_no": user.student_no,
+        "academic_no": user.academic_no,
+        "department_code": user.department_code,
+        "program_code": user.program_code,
+        "dining_card": dining_card,
+        "free_meals": has_free_meals(user, datetime.now(ATHENS_TZ).date()),
+    }
+
 # Dependency to get the DB session
 def get_db():
     db = SessionLocal()
@@ -277,7 +303,8 @@ def get_grades_endpoint(req: LoginRequest, db: Session = Depends(get_db)):
         return {
             "status": "success",
             "source": "database",
-            "data": data_list
+            "data": data_list,
+            "profile": serialize_profile(user),
         }
     else:
         # The plaintext password is encrypted before it touches the broker; the

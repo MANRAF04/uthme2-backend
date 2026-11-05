@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 ATHENS_TZ = ZoneInfo("Europe/Athens")
 UTC_TZ = ZoneInfo("UTC")
+DINE_BASE_URL = "https://sw-dine.uth.gr"
 
 
 def epoch_ms_to_athens_date(epoch_ms):
@@ -27,75 +28,107 @@ def epoch_ms_to_athens_date(epoch_ms):
 
     return dt_athens.date()
 
-def fetch_menus(username, password):
+def _open_dine_session(username, password, landing_path):
+    """Logs into sw-dine through CAS and returns a session carrying the CSRF and X-Profile headers."""
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0',
         'Accept-Language': 'en-US,en;q=0.9'
     })
-    
+
+    # 1. CAS Login
+    print("[Scraper] Fetching CAS login page...")
+    login_url = "https://cas.uth.gr/login?service=https%3A%2F%2Fsw-dine.uth.gr%2Flogin%2Fcas"
+    login_page = session.get(login_url, timeout=10)
+    soup = BeautifulSoup(login_page.text, 'html.parser')
+
+    execution_val = soup.find('input', {'name': 'execution'})['value']
+    lt_val = soup.find('input', {'name': 'lt'})['value']
+
+    payload = {
+        'username': username,
+        'password': password,
+        'execution': execution_val,
+        'lt': lt_val,
+        '_eventId': 'submit',
+        'submitForm': 'Login'
+    }
+
+    print("[Scraper] Submitting CAS login...")
+    session.post(login_url, data=payload, timeout=10)
+
+    # 2. Get the CSRF Token from the landing page HTML
+    print("[Scraper] Accessing dashboard for CSRF token...")
+    dash_response = session.get(f"{DINE_BASE_URL}{landing_path}", timeout=10)
+
+    if "cas.uth.gr" in dash_response.url:
+        raise Exception("CAS login failed.")
+
+    dash_soup = BeautifulSoup(dash_response.text, 'html.parser')
+    csrf_token_tag = dash_soup.find('meta', {'name': '_csrf'})
+    csrf_token = csrf_token_tag['content'] if csrf_token_tag else ""
+
+    # We need the CSRF token to ask the API for the Profile token
+    session.headers.update({
+        'X-CSRF-TOKEN': csrf_token,
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest'
+    })
+
+    # 3. Call the Profiles API
+    print("[Scraper] Calling Profiles API for X-Profile token...")
+    profile_response = session.get(f"{DINE_BASE_URL}/api/person/profiles", timeout=10)
+    profile_data = profile_response.json()
+
+    profile_token = ""
+    # Extract from studentProfiles (or teacherProfiles just in case)
+    if profile_data.get("studentProfiles") and len(profile_data["studentProfiles"]) > 0:
+        profile_token = profile_data["studentProfiles"][0].get("id")
+    elif profile_data.get("teacherProfiles") and len(profile_data["teacherProfiles"]) > 0:
+        profile_token = profile_data["teacherProfiles"][0].get("id")
+
+    if not profile_token:
+        raise Exception("Failed to find X-Profile token in sw-dine profiles response.")
+
+    session.headers.update({'X-Profile': profile_token})
+    return session
+
+
+def fetch_dining_card(username, password):
+    """Returns {"status": "success", "card": dict | None} or {"status": "error", "message": ...}.
+
+    card is None only when sw-dine answers that the student holds no card, so the
+    caller can tell "no card" apart from "could not ask".
+    """
     try:
-        # 1. CAS Login
-        print("[Scraper] Fetching CAS login page...")
-        login_url = "https://cas.uth.gr/login?service=https%3A%2F%2Fsw-dine.uth.gr%2Flogin%2Fcas"
-        login_page = session.get(login_url, timeout=10)
-        soup = BeautifulSoup(login_page.text, 'html.parser')
-        
-        execution_val = soup.find('input', {'name': 'execution'})['value']
-        lt_val = soup.find('input', {'name': 'lt'})['value']
-        
-        payload = {
-            'username': username,
-            'password': password,
-            'execution': execution_val,
-            'lt': lt_val,
-            '_eventId': 'submit',
-            'submitForm': 'Login'
-        }
-        
-        print("[Scraper] Submitting CAS login...")
-        session.post(login_url, data=payload, timeout=10)
-        
-        # 2. Get the CSRF Token from the dashboard HTML
-        print("[Scraper] Accessing dashboard for CSRF token...")
-        dash_response = session.get("https://sw-dine.uth.gr/student/restaurant/", timeout=10)
-        
-        if "cas.uth.gr" in dash_response.url:
-            raise Exception("CAS Login Failed! Check BOT_PASSWORD.")
+        session = _open_dine_session(username, password, "/student/dining_card/")
+        response = session.get(f"{DINE_BASE_URL}/feign/student/dining_card", timeout=10)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-        dash_soup = BeautifulSoup(dash_response.text, 'html.parser')
-        csrf_token_tag = dash_soup.find('meta', {'name': '_csrf'})
-        csrf_token = csrf_token_tag['content'] if csrf_token_tag else ""
-        
-        # We need the CSRF token to ask the API for the Profile token
-        session.headers.update({
-            'X-CSRF-TOKEN': csrf_token,
-            'Accept': 'application/json',
-            'X-Requested-With': 'XMLHttpRequest'
-        })
-        
-        # 3. Call the Profiles API (Your brilliant discovery!)
-        print("[Scraper] Calling Profiles API for X-Profile token...")
-        profile_response = session.get("https://sw-dine.uth.gr/api/person/profiles", timeout=10)
-        profile_data = profile_response.json()
-        
-        profile_token = ""
-        # Extract from studentProfiles (or teacherProfiles just in case)
-        if profile_data.get("studentProfiles") and len(profile_data["studentProfiles"]) > 0:
-            profile_token = profile_data["studentProfiles"][0].get("id")
-        elif profile_data.get("teacherProfiles") and len(profile_data["teacherProfiles"]) > 0:
-            profile_token = profile_data["teacherProfiles"][0].get("id")
-            
-        if not profile_token:
-             raise Exception(f"Failed to find X-Profile token in API response: {profile_data}")
-             
-        print(f"[Scraper] Success! Profile Token: {profile_token}")
+    if response.status_code != 200 or "application/json" not in response.headers.get("Content-Type", ""):
+        return {"status": "error", "message": f"Dining card API returned status {response.status_code}."}
 
-        # Add the final piece to our headers
-        session.headers.update({
-            'X-Profile': profile_token
-        })
-        
+    card = response.json() if response.text.strip() else None
+    if not card:
+        return {"status": "success", "card": None}
+
+    student = card.get("studentId") or {}
+    return {
+        "status": "success",
+        "card": {
+            "academic_no": student.get("academicNo"),
+            "active": bool(card.get("isActive")),
+            "valid_from": epoch_ms_to_athens_date(card["dateFrom"]) if card.get("dateFrom") else None,
+            "valid_to": epoch_ms_to_athens_date(card["dateTo"]) if card.get("dateTo") else None,
+        },
+    }
+
+
+def fetch_menus(username, password):
+    try:
+        session = _open_dine_session(username, password, "/student/restaurant/")
+
         # 4. Fetch Restaurants API
         print("[Scraper] Fetching restaurants API...")
         rest_response = session.get("https://sw-dine.uth.gr/feign/student/restaurant", timeout=10)

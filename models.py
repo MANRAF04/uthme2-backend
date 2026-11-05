@@ -13,6 +13,15 @@ class User(Base):
     last_updated = Column(DateTime(timezone=True), onupdate=func.now(), default=func.now())
     preferred_restaurant_id = Column(String, nullable=True)
     menu_notifications_enabled = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    student_no = Column(String, nullable=True)
+    academic_no = Column(String, nullable=True)
+    department_code = Column(String, nullable=True)
+    program_code = Column(String, nullable=True)
+    # Null means no dining card on file (or never fetched).
+    dining_card_active = Column(Boolean, nullable=True)
+    dining_card_valid_from = Column(Date, nullable=True)
+    dining_card_valid_to = Column(Date, nullable=True)
+    dining_card_checked_at = Column(DateTime(timezone=True), nullable=True)
 
 class Grade(Base):
     __tablename__ = "grades"
@@ -78,9 +87,11 @@ class Device(Base):
 
 
 class CourseNotification(Base):
-    """Fan-out ledger. One row per course per exam period, so each course pushes once a period."""
+    """Fan-out ledger. One row per course per department per exam period, so each course pushes once a period."""
     __tablename__ = "course_period_notifications"
     course_code = Column(String, primary_key=True)
+    # Course codes collide across departments. Empty string when the grader's department is unknown.
+    department_code = Column(String, primary_key=True, default="", server_default="")
     exam_period = Column(String, primary_key=True)
     notified_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -114,6 +125,39 @@ def ensure_schema_upgrades(engine):
             text(
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
                 "menu_notifications_enabled BOOLEAN NOT NULL DEFAULT true"
+            )
+        )
+        for column, column_type in (
+            ("student_no", "VARCHAR"),
+            ("academic_no", "VARCHAR"),
+            ("department_code", "VARCHAR"),
+            ("program_code", "VARCHAR"),
+            ("dining_card_active", "BOOLEAN"),
+            ("dining_card_valid_from", "DATE"),
+            ("dining_card_valid_to", "DATE"),
+            ("dining_card_checked_at", "TIMESTAMPTZ"),
+        ):
+            conn.execute(text(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {column} {column_type}"))
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.key_column_usage
+                        WHERE table_name = 'course_period_notifications'
+                          AND constraint_name = 'course_period_notifications_pkey'
+                          AND column_name = 'department_code'
+                    ) THEN
+                        ALTER TABLE course_period_notifications
+                            ADD COLUMN IF NOT EXISTS department_code VARCHAR NOT NULL DEFAULT '';
+                        ALTER TABLE course_period_notifications
+                            DROP CONSTRAINT IF EXISTS course_period_notifications_pkey;
+                        ALTER TABLE course_period_notifications
+                            ADD PRIMARY KEY (course_code, department_code, exam_period);
+                    END IF;
+                END $$;
+                """
             )
         )
         conn.execute(text("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS meal_type_id VARCHAR"))
