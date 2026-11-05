@@ -11,7 +11,9 @@ if not db_pass:
     )
 
 DATABASE_URL = URL.create(
-    "postgresql",
+    # Explicit driver: SQLAlchemy 2.1 switched the bare "postgresql" default to
+    # psycopg 3, and only psycopg2-binary is installed.
+    "postgresql+psycopg2",
     username="grades_user",
     password=db_pass,
     host="postgres-grades",
