@@ -8,3 +8,4 @@ psycopg2-binary
 sqlalchemy
 cryptography
 firebase-admin>=7.7.0
+packaging

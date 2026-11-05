@@ -1,8 +1,10 @@
 """Push fan-out for newly graded courses.
 
 When one student's scrape turns up a new mark on a course they had not passed,
-every other student who has not passed that course code is told to open the app,
-at most once per course per exam period. The grade value
+every other student in the same department who has not passed that course code is
+told to open the app, at most once per course per department per exam period.
+Course codes are only unique within a department. A student whose department is
+not known yet (no sync since it started being stored) matches any department. The grade value
 itself never leaves the server: the payload names the course and nothing else.
 """
 
@@ -28,9 +30,9 @@ _TEXTS = {
 # the same course and period blocks until the first commits or rolls back.
 _CLAIM_COURSE_SQL = text(
     """
-    INSERT INTO course_period_notifications (course_code, exam_period)
-    VALUES (:course_code, :exam_period)
-    ON CONFLICT (course_code, exam_period) DO NOTHING
+    INSERT INTO course_period_notifications (course_code, department_code, exam_period)
+    VALUES (:course_code, :department_code, :exam_period)
+    ON CONFLICT (course_code, department_code, exam_period) DO NOTHING
     RETURNING course_code
     """
 )
@@ -40,9 +42,15 @@ _RECIPIENTS_SQL = text(
     SELECT DISTINCT d.fcm_token, d.locale
     FROM devices d
     JOIN grades g ON g.user_id = d.user_id
+    JOIN users u ON u.id = d.user_id
     WHERE g.course_code = :course_code
       AND g.passed = false
       AND d.user_id <> :trigger_user_id
+      AND (
+          CAST(:department_code AS VARCHAR) IS NULL
+          OR u.department_code IS NULL
+          OR u.department_code = :department_code
+      )
     """
 )
 
@@ -69,7 +77,21 @@ def _localized(language: str, course_title: str) -> tuple[str, str]:
     return strings["title"], strings["body"].format(course=course_title)
 
 
-def _claim_and_load(db, course_code: str, trigger_user_id: int):
+def _department_of(db, user_id: int) -> str | None:
+    return db.execute(
+        text("SELECT department_code FROM users WHERE id = :user_id"), {"user_id": user_id}
+    ).scalar()
+
+
+def _claim_key(course_code: str, department_code: str | None) -> dict:
+    return {
+        "course_code": course_code,
+        "department_code": department_code or "",
+        "exam_period": current_exam_period(),
+    }
+
+
+def _claim_and_load(db, course_code: str, department_code: str | None, trigger_user_id: int):
     """Claim this period's slot and read the waiting devices in one transaction.
 
     Returns (claimed, fids_by_language). When nobody is waiting the claim is
@@ -77,17 +99,18 @@ def _claim_and_load(db, course_code: str, trigger_user_id: int):
     period without a push ever going out.
     """
     try:
-        claimed = db.execute(
-            _CLAIM_COURSE_SQL,
-            {"course_code": course_code, "exam_period": current_exam_period()},
-        ).first()
+        claimed = db.execute(_CLAIM_COURSE_SQL, _claim_key(course_code, department_code)).first()
         if claimed is None:
             db.rollback()
             return False, {}
 
         rows = db.execute(
             _RECIPIENTS_SQL,
-            {"course_code": course_code, "trigger_user_id": trigger_user_id},
+            {
+                "course_code": course_code,
+                "department_code": department_code,
+                "trigger_user_id": trigger_user_id,
+            },
         ).all()
         if not rows:
             db.rollback()
@@ -101,15 +124,17 @@ def _claim_and_load(db, course_code: str, trigger_user_id: int):
     return True, push.group_by_language(rows)
 
 
-def _release_course(db, course_code: str) -> None:
+def _release_course(db, course_code: str, department_code: str | None) -> None:
     """Drop this period's slot so a failed fan-out can be retried."""
     try:
         db.execute(
             text(
                 "DELETE FROM course_period_notifications "
-                "WHERE course_code = :course_code AND exam_period = :exam_period"
+                "WHERE course_code = :course_code "
+                "AND department_code = :department_code "
+                "AND exam_period = :exam_period"
             ),
-            {"course_code": course_code, "exam_period": current_exam_period()},
+            _claim_key(course_code, department_code),
         )
         db.commit()
     except Exception as e:
@@ -124,13 +149,16 @@ def notify_course_graded(trigger_user_id: int, courses: list[dict]) -> dict:
 
     db = SessionLocal()
     try:
+        department_code = _department_of(db, trigger_user_id)
         for course in courses:
             course_code = course.get("code")
             course_title = course.get("title") or course_code
             if not course_code:
                 continue
 
-            claimed, fids_by_language = _claim_and_load(db, course_code, trigger_user_id)
+            claimed, fids_by_language = _claim_and_load(
+                db, course_code, department_code, trigger_user_id
+            )
             if not claimed:
                 skipped.append(course_code)
                 continue
@@ -160,7 +188,7 @@ def notify_course_graded(trigger_user_id: int, courses: list[dict]) -> dict:
                         dead.extend(batch_dead)
             except Exception:
                 if delivered == 0:
-                    _release_course(db, course_code)
+                    _release_course(db, course_code, department_code)
                 raise
 
             push.delete_devices(db, dead)
