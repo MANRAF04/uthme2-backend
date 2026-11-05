@@ -11,11 +11,12 @@ university portal through an OpenVPN tunnel.
 | `tasks.py` | Celery worker + beat (grade sync on demand, menu scrape daily at 04:00) |
 | `scraper.py`, `dine_scraper.py` | BeautifulSoup scrapers |
 | `models.py`, `database.py` | SQLAlchemy models, PostgreSQL session |
+| `notifications.py` | FCM fan-out when a course gets graded, plus the once-per-exam-period ledger |
 | `security.py` | Password hashing (scrypt) and Fernet encryption for credentials in transit |
 | `uth.ovpn` | VPN profile. Gitignored, kept on the server only |
 
-Runs as three containers built from this directory (`grades-api`, `grades-worker`,
-`grades-beat`), against `postgres-grades:5432` and `redis-grades:6379`.
+Runs as four containers built from this directory (`grades-api`, `grades-worker`,
+`grades-beat`, `grades-notifier`), against `postgres-grades:5432` and `redis-grades:6379`.
 
 ## Environment
 
@@ -29,6 +30,8 @@ service definitions. The app reads plain environment variables, never a `.env` f
 | `CRED_ENC_KEY` | API, worker | Fernet key, **must be identical on both** |
 | `BOT_USERNAME` | worker | University account for the scheduled menu scrape |
 | `BOT_PASSWORD` | worker | Same |
+| `FIREBASE_CREDENTIALS_FILE` | notifier | Path to the mounted service account JSON. Defaults to `/app/secrets/firebase-service-account.json` |
+| `FIREBASE_CREDENTIALS_JSON` | notifier | Alternative to the file, the whole JSON key as one value. The file wins if both are present |
 
 Generate the Fernet key with:
 
@@ -36,11 +39,106 @@ Generate the Fernet key with:
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
+## Push notifications
+
+When a student refreshes and the scrape turns up a new mark on a course they had not passed
+(a first mark, or a retake replacing a failing one), every other student who has not passed
+that same course code is told to open the app. The mark
+itself never leaves the server. The payload names the course and nothing else.
+
+### Flow
+
+1. `sync_user_grades` scrapes and `save_to_database` returns the not-yet-passed courses whose
+   mark appeared or changed on this run.
+2. A student's very first sync returns nothing. That run inserts their whole history at
+   once, which is a cache fill rather than a grading event.
+3. Once the tunnel is down, the worker queues `notify_graded_courses` on the
+   `notifications` queue.
+4. `grades-notifier` picks it up, claims the course's slot for the current exam period, looks
+   up every device whose owner has that course with `passed = false`, and sends.
+
+The split matters. `uth.ovpn` sets `redirect-gateway def1`, so while the grade worker holds
+the tunnel open all of its traffic leaves through the university network. `grades-notifier`
+never starts OpenVPN and never asks for `NET_ADMIN`, so FCM calls take the normal route and
+a slow send cannot block the grade queue. `grades-worker` is pinned to `-Q celery` so it
+cannot pick up a fan-out by accident.
+
+### Once per exam period
+
+`course_period_notifications` holds one row per (course, exam period). The portal exposes no
+period field, so the period is derived from the date: results published Dec to Apr count as
+`<year>-winter` (December rolls into the next year), May to Aug as `<year>-spring`, Sep to
+Nov as `<year>-september`.
+
+The claim is a single `INSERT ... ON CONFLICT DO NOTHING`, which takes the row lock, so two
+notifiers racing on the same course cannot both send. A course nobody was waiting on rolls its
+claim back rather than burning the period. A failed send releases the slot so the Celery retry
+can work.
+
+Without this, a wave of students refreshing after the first notification would each detect
+their own new mark and start another round.
+
+### Grouping
+
+Recipients are matched on `course_code` alone. There is no department column anywhere in
+the schema, and the app never sends one. Two departments reusing the same course code would
+cross-notify. If that shows up in practice, the fix is to capture the department from
+`studentProfiles[0]` in `scraper.py` (the profiles call is already made for the `X-Profile`
+header) and add it to the join.
+
+### Firebase setup
+
+1. Create a Firebase project and add the Android and iOS apps.
+2. *Project settings > Service accounts > Generate new private key*.
+3. Put the JSON on the server at `secrets/firebase-service-account.json` inside this
+   directory. It is gitignored and dockerignored, so it survives deploys and never reaches
+   the image, the same treatment `uth.ovpn` gets.
+4. The file has to exist before `docker compose up`. Docker creates a directory in its
+   place otherwise and the notifier fails with a confusing error.
+
+### Client contract
+
+Both endpoints take the same body credentials as the rest of the API.
+
+```
+POST /api/devices/register
+{"username": "...", "password": "...", "fcm_token": "...", "platform": "android", "locale": "el"}
+
+POST /api/devices/unregister
+{"username": "...", "password": "...", "fcm_token": "..."}
+```
+
+Register once the first sync has succeeded. Before that the user has no password hash on
+file and the call returns 401. Unregister on logout, before the app clears its stored
+credentials.
+
+`fcm_token` carries the device's Firebase Installation ID (FID), which the app gets from
+`FirebaseMessaging.onRegistered`. The notifier sends with `MulticastMessage(fids=...)`, so
+`firebase-admin` must be 7.7.0 or newer.
+
+A token is unique across the table and follows the handset. Registering one that already
+exists moves it to the calling account, so a shared phone stops receiving the previous
+student's pushes.
+
+The message carries both a `notification` block (rendered by the OS when the app is in the
+background) and a `data` block:
+
+```
+{"type": "course_graded", "course_code": "...", "course_title": "..."}
+```
+
+Notification text is picked server side from the `locale` sent at registration (`el` or
+`en`, defaulting to `el`). The Android config names channel `grades`, which the app has to
+create for Android 8 and up.
+
+The Flutter client lives in `../uthme2`.
+
 ## Running
 
 ```
 uvicorn main:app --host 0.0.0.0 --port 8000
-celery -A tasks worker --loglevel=info
+celery -A tasks worker --loglevel=info -Q celery
+celery -A tasks worker --loglevel=info -Q notifications
 celery -A tasks beat --loglevel=info
 ```
 
@@ -153,8 +251,8 @@ ssh-keyscan 10.8.0.1
 | `SSH_PORT` | Optional, defaults to `22` |
 
 Optional repository *variable* `COMPOSE_SERVICES`, space separated. It defaults to
-`grades-api grades-worker grades-beat` in the script, which is what keeps a shared compose file
-from rebuilding and recreating unrelated services.
+`grades-api grades-worker grades-beat grades-notifier` in the script, which is what keeps a
+shared compose file from rebuilding and recreating unrelated services.
 
 ### Notes
 

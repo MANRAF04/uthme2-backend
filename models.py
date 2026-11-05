@@ -64,6 +64,26 @@ class RestaurantMealType(Base):
     is_active = Column(Boolean, nullable=False, default=True)
 
 
+class Device(Base):
+    """A phone registered for push. One row per FCM token."""
+    __tablename__ = "devices"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    fcm_token = Column(String, unique=True, index=True, nullable=False)
+    platform = Column(String, nullable=True)
+    locale = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class CourseNotification(Base):
+    """Fan-out ledger. One row per course per exam period, so each course pushes once a period."""
+    __tablename__ = "course_period_notifications"
+    course_code = Column(String, primary_key=True)
+    exam_period = Column(String, primary_key=True)
+    notified_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 def ensure_schema_upgrades(engine):
     """Adds missing columns/tables for incremental deployments without Alembic."""
     with engine.begin() as conn:
@@ -72,6 +92,12 @@ def ensure_schema_upgrades(engine):
             text(
                 "CREATE INDEX IF NOT EXISTS ix_grades_user_updated "
                 "ON grades (user_id, updated_at DESC)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_grades_not_passed_course "
+                "ON grades (course_code) WHERE passed = false"
             )
         )
         conn.execute(text("ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS meal_type_id VARCHAR"))

@@ -7,6 +7,7 @@ from dine_scraper import fetch_menus
 from scraper import fetch_grades
 from database import SessionLocal, engine
 import models
+import notifications
 import security
 from models import Grade, User, Restaurant, MenuItem, RestaurantMealType
 from datetime import datetime, timezone
@@ -26,6 +27,23 @@ app.conf.beat_schedule = {
     },
 }
 app.conf.timezone = 'Europe/Athens'
+
+# The grade worker holds the VPN up, and uth.ovpn sets `redirect-gateway def1`,
+# so anything it sends leaves through the university network. Push fan-out goes
+# to its own queue, consumed by a worker that never touches the tunnel.
+app.conf.task_routes = {
+    'tasks.notify_graded_courses': {'queue': 'notifications'},
+}
+
+
+@app.task(bind=True, max_retries=3, default_retry_delay=60)
+def notify_graded_courses(self, trigger_user_id: int, courses: list):
+    """Tells students still waiting on these courses that a grade is out."""
+    try:
+        return notifications.notify_course_graded(trigger_user_id, courses)
+    except Exception as e:
+        print(f"[Notify] Fan-out failed for user {trigger_user_id}: {e}")
+        raise self.retry(exc=e)
 
 @app.task(bind=True)
 def sync_university_menus(self):
@@ -175,6 +193,7 @@ def sync_user_grades(self, user_id: int, username: str, encrypted_password: str)
 
     auth_file = f"/tmp/auth_{user_id}.txt"
     vpn_process = None
+    newly_graded = []
 
     try:
         # 1. Create the temporary auth file for OpenVPN (owner-readable only)
@@ -211,7 +230,7 @@ def sync_user_grades(self, user_id: int, username: str, encrypted_password: str)
             return {"status": "error", "message": scrape_result["error"]}
 
         # 5. Save the data to PostgreSQL
-        save_to_database(user_id, scrape_result["data"], password)
+        newly_graded = save_to_database(user_id, scrape_result["data"], password)
         
         return {"status": "success", "message": f"Successfully synced {len(scrape_result['data'])} grades."}
 
@@ -228,18 +247,39 @@ def sync_user_grades(self, user_id: int, username: str, encrypted_password: str)
         if os.path.exists(auth_file):
             os.remove(auth_file)
 
+        # Queued only once the tunnel is down, so the fan-out never inherits the
+        # VPN's default route.
+        if newly_graded:
+            print(f"[Worker] {len(newly_graded)} newly graded course(s) for {username}, queueing push.")
+            notify_graded_courses.delay(user_id, newly_graded)
+
 
 def save_to_database(user_id: int, parsed_grades: list, password: str):
     """
     Upserts (Updates or Inserts) grades into PostgreSQL.
+
+    Returns the not-yet-passed courses that got a new mark on this scrape, as
+    [{"code": ..., "title": ...}], for the push fan-out.
     """
     db = SessionLocal()
     try:
+        # A student syncing for the first time inserts their whole history at
+        # once. That is a cache fill, not a grading event, so it notifies nobody.
+        is_first_sync = (
+            db.query(Grade.id).filter(Grade.user_id == user_id).first() is None
+        )
+
+        newly_graded = {}
+
         for item in parsed_grades:
             # Check if this exact grade already exists
             existing_grade = db.query(Grade).filter(Grade.id == item["id"]).first()
             
             if existing_grade:
+                was_pending = not existing_grade.passed
+                grade_appeared = (
+                    item["grade"] is not None and existing_grade.grade != item["grade"]
+                )
                 # Only stamp updated_at when the value truly changed (a new grade
                 # appeared or a teacher fixed a mistake). Bumping it every scrape
                 # would make "latest grade" meaningless.
@@ -252,6 +292,12 @@ def save_to_database(user_id: int, parsed_grades: list, password: str):
                     changed = True
                 if changed:
                     existing_grade.updated_at = datetime.now(timezone.utc)
+
+                # Covers both a first mark and a retake replacing a failing one.
+                # Corrections to an already passed course are not news for anyone.
+                # Repeats within one exam period are absorbed by the notifier.
+                if was_pending and grade_appeared:
+                    newly_graded[item["code"]] = item["title"]
             else:
                 # Insert a new grade record
                 new_grade = Grade(
@@ -266,6 +312,9 @@ def save_to_database(user_id: int, parsed_grades: list, password: str):
                     type=item["type"]
                 )
                 db.add(new_grade)
+
+                if item["grade"] is not None:
+                    newly_graded[item["code"]] = item["title"]
         
         # Update the user's last_updated timestamp
         user = db.query(User).filter(User.id == user_id).first()
@@ -279,3 +328,7 @@ def save_to_database(user_id: int, parsed_grades: list, password: str):
         raise e
     finally:
         db.close()
+
+    if is_first_sync:
+        return []
+    return [{"code": code, "title": title} for code, title in newly_graded.items()]

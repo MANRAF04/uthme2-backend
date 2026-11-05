@@ -16,6 +16,7 @@ env/
 *.key
 auth_*.txt
 *.ovpn
+secrets/
 
 *.log
 .pytest_cache/

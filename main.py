@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -52,6 +52,13 @@ class PreferenceRequest(BaseModel):
     username: str
     password: str
     restaurant_id: str
+
+class DeviceRequest(BaseModel):
+    username: str
+    password: str
+    fcm_token: str = Field(min_length=10, max_length=4096)
+    platform: Optional[str] = Field(default=None, max_length=16)
+    locale: Optional[str] = Field(default=None, max_length=16)
 
 @app.get("/api/restaurants")
 def get_restaurants(db: Session = Depends(get_db)):
@@ -168,6 +175,64 @@ def set_user_preference(req: PreferenceRequest, db: Session = Depends(get_db)):
     db.commit()
     
     return {"status": "success", "message": "Preference saved"}
+
+def authenticate(db: Session, username: str, password: str) -> models.User:
+    """Same body-credential check the other write endpoints use."""
+    user = db.query(models.User).filter(models.User.username == username).first()
+
+    if not user or not security.verify_password(password, user.encrypted_password):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if security.needs_rehash(user.encrypted_password):
+        user.encrypted_password = security.hash_password(password)
+
+    return user
+
+@app.post("/api/devices/register")
+def register_device(req: DeviceRequest, db: Session = Depends(get_db)):
+    """Stores a Firebase Installation ID so this student can be told when a course is graded."""
+    user = authenticate(db, req.username, req.password)
+
+    device = (
+        db.query(models.Device)
+        .filter(models.Device.fcm_token == req.fcm_token)
+        .first()
+    )
+
+    if device:
+        # The token follows the handset, not the account. Reassigning it stops a
+        # phone that switched accounts from receiving the previous student's push.
+        device.user_id = user.id
+        device.platform = req.platform
+        device.locale = req.locale
+        device.last_seen_at = datetime.now(UTC_TZ)
+    else:
+        db.add(
+            models.Device(
+                user_id=user.id,
+                fcm_token=req.fcm_token,
+                platform=req.platform,
+                locale=req.locale,
+            )
+        )
+
+    db.commit()
+    return {"status": "success", "message": "Device registered"}
+
+@app.post("/api/devices/unregister")
+def unregister_device(req: DeviceRequest, db: Session = Depends(get_db)):
+    """Drops an FCM token. Call this on logout, before clearing credentials."""
+    user = authenticate(db, req.username, req.password)
+
+    deleted = (
+        db.query(models.Device)
+        .filter(models.Device.fcm_token == req.fcm_token)
+        .filter(models.Device.user_id == user.id)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    return {"status": "success", "message": f"Removed {deleted} device(s)"}
 
 @app.post("/api/get-grades")
 def get_grades_endpoint(req: LoginRequest, db: Session = Depends(get_db)):

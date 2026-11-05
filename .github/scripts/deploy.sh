@@ -4,7 +4,7 @@ set -euo pipefail
 : "${DEPLOY_PATH:?DEPLOY_PATH is not set}"
 
 COMPOSE_DIR="${COMPOSE_DIR:-$DEPLOY_PATH}"
-COMPOSE_SERVICES="${COMPOSE_SERVICES:-grades-api grades-worker grades-beat}"
+COMPOSE_SERVICES="${COMPOSE_SERVICES:-grades-api grades-worker grades-beat grades-notifier}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 GIT_SHA="${GIT_SHA:-}"
 
