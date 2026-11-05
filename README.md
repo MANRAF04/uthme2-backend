@@ -8,10 +8,12 @@ university portal through an OpenVPN tunnel.
 | Piece | What it does |
 | --- | --- |
 | `main.py` | FastAPI app (restaurants, menus, grades, user preferences) |
-| `tasks.py` | Celery worker + beat (grade sync on demand, menu scrape daily at 04:00) |
+| `tasks.py` | Celery worker + beat (grade sync on demand, menu scrape daily at 04:00, menu push check every 10 minutes) |
 | `scraper.py`, `dine_scraper.py` | BeautifulSoup scrapers |
 | `models.py`, `database.py` | SQLAlchemy models, PostgreSQL session |
-| `notifications.py` | FCM fan-out when a course gets graded, plus the once-per-exam-period ledger |
+| `push.py` | Shared FCM sender: Firebase app, multicast, dead-device cleanup |
+| `grade_notifications.py` | Fan-out when a course gets graded, plus the once-per-exam-period ledger |
+| `menu_notifications.py` | Pre-meal push with the preferred restaurant's main courses |
 | `security.py` | Password hashing (scrypt) and Fernet encryption for credentials in transit |
 | `uth.ovpn` | VPN profile. Gitignored, kept on the server only |
 
@@ -96,9 +98,34 @@ header) and add it to the join.
 4. The file has to exist before `docker compose up`. Docker creates a directory in its
    place otherwise and the notifier fails with a confusing error.
 
+### Meal menus
+
+Every 10 minutes Beat queues `send_menu_notifications` on the `notifications` queue. For
+each restaurant that at least one student has as their preferred restaurant (with the toggle
+on and a registered device), it looks at today's `Μεσημεριανό` and `Βραδινό`. The first run
+inside `[start - 2h, start)` sends one push per (restaurant, day, meal), tracked in
+`menu_notifications`.
+
+- Start time is `meal_hour_from`. When the portal leaves it blank, lunch falls back to 13:00
+  and dinner to 19:30 (the most common hours in the data).
+- Body lists the `ΚΥΡΙΩΣ` dishes in menu order. No main courses, no push.
+- When an `ΕΠΙΔΟΡΠΙΟ` item is exactly `Γλυκό`, the title switches to the sweet variant
+  (`Μεσημεριανό στις 13:00, έχει Γλυκό!`).
+- A meal nobody is subscribed to rolls its claim back, so a student who picks the
+  restaurant before the meal starts still gets it. A failed send releases the slot and the
+  next tick retries.
+- Students without a preferred restaurant get nothing. `users.menu_notifications_enabled`
+  (default true) is the opt-out.
+
+Android channel is `menus`. Data payload:
+
+```
+{"type": "menu_upcoming", "restaurant_id": "...", "meal_type": "..."}
+```
+
 ### Client contract
 
-Both endpoints take the same body credentials as the rest of the API.
+All endpoints take the same body credentials as the rest of the API.
 
 ```
 POST /api/devices/register
@@ -106,7 +133,13 @@ POST /api/devices/register
 
 POST /api/devices/unregister
 {"username": "...", "password": "...", "fcm_token": "..."}
+
+POST /api/user/menu-notifications
+{"username": "...", "password": "...", "enabled": true}
 ```
+
+`register` returns the account's `menu_notifications_enabled`, so a reinstalled app picks up
+the stored choice.
 
 Register once the first sync has succeeded. Before that the user has no password hash on
 file and the call returns 401. Unregister on logout, before the app clears its stored

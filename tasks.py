@@ -7,7 +7,8 @@ from dine_scraper import fetch_menus
 from scraper import fetch_grades
 from database import SessionLocal, engine
 import models
-import notifications
+import grade_notifications
+import menu_notifications
 import security
 from models import Grade, User, Restaurant, MenuItem, RestaurantMealType
 from datetime import datetime, timezone
@@ -19,11 +20,16 @@ models.ensure_schema_upgrades(engine)
 app = Celery('grades_tasks', broker='redis://redis-grades:6379/0',backend='redis://redis-grades:6379/0')
 
 # --- CELERY BEAT SCHEDULE ---
-# This tells Celery to run the task every day at 4:00 AM.
 app.conf.beat_schedule = {
     'daily-menu-scrape': {
         'task': 'tasks.sync_university_menus',
         'schedule': crontab(hour=4, minute=0), 
+    },
+    'upcoming-menu-notifications': {
+        'task': 'tasks.send_menu_notifications',
+        'schedule': crontab(minute='*/10'),
+        # A run stuck in the queue past the next tick is redundant.
+        'options': {'expires': 9 * 60},
     },
 }
 app.conf.timezone = 'Europe/Athens'
@@ -33,14 +39,21 @@ app.conf.timezone = 'Europe/Athens'
 # to its own queue, consumed by a worker that never touches the tunnel.
 app.conf.task_routes = {
     'tasks.notify_graded_courses': {'queue': 'notifications'},
+    'tasks.send_menu_notifications': {'queue': 'notifications'},
 }
+
+
+@app.task
+def send_menu_notifications():
+    """Pushes the main courses of each preferred restaurant two hours before a meal."""
+    return menu_notifications.send_upcoming_menu_notifications()
 
 
 @app.task(bind=True, max_retries=3, default_retry_delay=60)
 def notify_graded_courses(self, trigger_user_id: int, courses: list):
     """Tells students still waiting on these courses that a grade is out."""
     try:
-        return notifications.notify_course_graded(trigger_user_id, courses)
+        return grade_notifications.notify_course_graded(trigger_user_id, courses)
     except Exception as e:
         print(f"[Notify] Fan-out failed for user {trigger_user_id}: {e}")
         raise self.retry(exc=e)

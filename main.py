@@ -53,6 +53,11 @@ class PreferenceRequest(BaseModel):
     password: str
     restaurant_id: str
 
+class MenuNotificationsRequest(BaseModel):
+    username: str
+    password: str
+    enabled: bool
+
 class DeviceRequest(BaseModel):
     username: str
     password: str
@@ -217,7 +222,19 @@ def register_device(req: DeviceRequest, db: Session = Depends(get_db)):
         )
 
     db.commit()
-    return {"status": "success", "message": "Device registered"}
+    return {
+        "status": "success",
+        "message": "Device registered",
+        "menu_notifications_enabled": user.menu_notifications_enabled,
+    }
+
+@app.post("/api/user/menu-notifications")
+def set_menu_notifications(req: MenuNotificationsRequest, db: Session = Depends(get_db)):
+    """Turns the pre-meal push for the preferred restaurant on or off."""
+    user = authenticate(db, req.username, req.password)
+    user.menu_notifications_enabled = req.enabled
+    db.commit()
+    return {"status": "success", "menu_notifications_enabled": user.menu_notifications_enabled}
 
 @app.post("/api/devices/unregister")
 def unregister_device(req: DeviceRequest, db: Session = Depends(get_db)):
